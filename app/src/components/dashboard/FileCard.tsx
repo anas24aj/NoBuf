@@ -21,10 +21,11 @@ interface FileCardProps {
     onToggleSelection?: () => void;
 }
 
-// Check if file is an image type that can have a thumbnail
-function isImageFile(filename: string): boolean {
+// Telegram provides still thumbnails for images and videos.
+function hasThumbnail(filename: string): boolean {
     const ext = filename.split('.').pop()?.toLowerCase() || '';
-    return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
+    return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp',
+        'mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v', 'mpeg', 'mpg', 'ts', 'm2ts', '3gp'].includes(ext);
 }
 
 export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onContextMenu, onDrop, onDragStart, onDragEnd, activeFolderId, height, onToggleSelection }: FileCardProps) {
@@ -35,9 +36,11 @@ export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onCo
     const cacheSession = useCacheSession();
     const cacheInfo = cacheSession.getCacheInfo(file.id);
 
-    // Lazy load thumbnail for image files
+    // Load Telegram's thumbnail without downloading the video itself.
     useEffect(() => {
-        if (isFolder || !isImageFile(file.name)) return;
+        setThumbnail(null);
+        setThumbnailLoading(false);
+        if (isFolder || !hasThumbnail(file.name)) return;
 
         let cancelled = false;
         setThumbnailLoading(true);
@@ -120,7 +123,7 @@ export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onCo
                     <div className="absolute inset-0 flex items-center justify-center p-4">
                         {isFolder ? (
                             <Folder className="w-12 h-12 text-nobuf-primary" />
-                        ) : thumbnailLoading && isImageFile(file.name) ? (
+                        ) : thumbnailLoading ? (
                             <div className="w-8 h-8 border-2 border-nobuf-primary/30 border-t-nobuf-primary rounded-full animate-spin" />
                         ) : (
                             <FileTypeIcon filename={file.name} size="lg" />
