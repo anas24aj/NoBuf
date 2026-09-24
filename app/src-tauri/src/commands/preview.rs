@@ -1,6 +1,6 @@
 use tauri::State;
 use tauri::Manager;
-use grammers_client::types::Media;
+use grammers_client::types::{Media, photo_sizes::PhotoSize};
 use base64::{Engine as _, engine::general_purpose};
 use crate::TelegramState;
 use crate::bandwidth::BandwidthManager;
@@ -198,9 +198,84 @@ pub async fn cmd_clean_cache(
     Ok(())
 }
 
-/// Get a small thumbnail for inline display in file cards.
-/// Returns base64 data URL for images, empty string for non-image files.
-/// Uses same cache as cmd_get_preview for consistency.
+// Keep grid requests from flooding Telegram when a channel has many videos.
+static THUMBNAIL_DOWNLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+fn thumbnail_cache_prefix(folder_id: Option<i64>, message_id: i32) -> String {
+    let peer = folder_id.map(|id| id.to_string()).unwrap_or_else(|| "saved".to_string());
+    format!("{}_{}.", peer, message_id)
+}
+
+fn best_document_thumbnail(thumbs: Vec<PhotoSize>) -> Option<PhotoSize> {
+    thumbs.into_iter()
+        .filter(|thumb| !matches!(thumb, PhotoSize::Empty(_) | PhotoSize::Path(_)))
+        .filter(|thumb| thumb.size() > 0 && thumb.size() <= 2 * 1024 * 1024)
+        .max_by_key(|thumb| thumb.size())
+}
+
+#[cfg(test)]
+mod thumbnail_tests {
+    use super::*;
+    use grammers_client::types::{media::Document, Downloadable};
+    use grammers_tl_types as tl;
+
+    fn video_thumbs(thumbs: Vec<tl::enums::PhotoSize>) -> Vec<PhotoSize> {
+        Document::from_raw_media(tl::types::MessageMediaDocument {
+            nopremium: false, spoiler: false, video: true, round: false, voice: false,
+            document: Some(tl::types::Document {
+                id: 123, access_hash: 456, file_reference: vec![1], date: 0,
+                mime_type: "video/mp4".into(), size: 100_000_000,
+                thumbs: Some(thumbs), video_thumbs: None, dc_id: 2, attributes: vec![],
+            }.into()),
+            alt_documents: None, video_cover: None, video_timestamp: None, ttl_seconds: None,
+        }).thumbs()
+    }
+
+    #[test]
+    fn uses_document_thumbnail_location_not_full_video() {
+        let thumbs = video_thumbs(vec![
+            tl::types::PhotoSize { r#type: "s".into(), w: 90, h: 90, size: 1000 }.into(),
+            tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 180, size: 9000 }.into(),
+        ]);
+        let thumb = best_document_thumbnail(thumbs).unwrap();
+        match thumb.to_raw_input_location().unwrap() {
+            tl::enums::InputFileLocation::InputDocumentFileLocation(location) => {
+                assert_eq!(location.id, 123);
+                assert_eq!(location.thumb_size, "m");
+            }
+            _ => panic!("expected a document thumbnail location"),
+        }
+    }
+
+    #[test]
+    fn skips_missing_vector_and_oversized_thumbnails() {
+        assert!(best_document_thumbnail(video_thumbs(vec![])).is_none());
+        let thumbs = video_thumbs(vec![
+            tl::types::PhotoSizeEmpty { r#type: "s".into() }.into(),
+            tl::types::PhotoPathSize { r#type: "j".into(), bytes: vec![1, 2] }.into(),
+            tl::types::PhotoSize { r#type: "w".into(), w: 4000, h: 4000, size: 3_000_000 }.into(),
+        ]);
+        assert!(best_document_thumbnail(thumbs).is_none());
+    }
+
+    #[test]
+    fn supports_inline_thumbnails_without_network_download() {
+        let thumb = best_document_thumbnail(video_thumbs(vec![
+            tl::types::PhotoCachedSize { r#type: "s".into(), w: 90, h: 90, bytes: vec![1, 2, 3] }.into(),
+        ])).unwrap();
+        assert_eq!(thumb.to_data(), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn separates_same_message_id_in_different_channels_and_saved_messages() {
+        assert_ne!(thumbnail_cache_prefix(Some(1), 42), thumbnail_cache_prefix(Some(2), 42));
+        assert_ne!(thumbnail_cache_prefix(None, 42), thumbnail_cache_prefix(Some(0), 42));
+        assert!(!"1_420.jpg".starts_with(&thumbnail_cache_prefix(Some(1), 42)));
+    }
+}
+
+/// Get an image or Telegram-provided video thumbnail for a file card.
+/// Videos without a still thumbnail retain their file icon; never fetch the full video.
 #[tauri::command]
 pub async fn cmd_get_thumbnail(
     message_id: i32,
@@ -208,6 +283,8 @@ pub async fn cmd_get_thumbnail(
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<String, String> {
+    let _permit = THUMBNAIL_DOWNLOADS.acquire().await.map_err(|e| e.to_string())?;
+    let cache_prefix = thumbnail_cache_prefix(folder_id, message_id);
     // Check if thumbnail already in cache
     let cache_dir = app_handle
         .path()
@@ -223,7 +300,7 @@ pub async fn cmd_get_thumbnail(
     if let Ok(entries) = std::fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&format!("{}.", message_id)) {
+            if name.starts_with(&cache_prefix) {
                 // Found cached thumbnail, return as base64
                 if let Ok(bytes) = std::fs::read(entry.path()) {
                     let ext = name.rsplit('.').next().unwrap_or("jpg");
@@ -266,8 +343,26 @@ pub async fn cmd_get_thumbnail(
                         };
                         (true, e.to_string())
                     } else {
-                        // Not an image, return empty - FileCard will show icon
-                        return Ok("".to_string());
+                        let Some(thumb) = best_document_thumbnail(d.thumbs()) else {
+                            return Ok(String::new());
+                        };
+                        let bytes = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                            let mut download = client.iter_download(&thumb);
+                            let mut bytes = Vec::new();
+                            while let Some(chunk) = download.next().await.map_err(|e| e.to_string())? {
+                                if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                                    return Err("Thumbnail exceeds size limit".to_string());
+                                }
+                                bytes.extend_from_slice(&chunk);
+                            }
+                            Ok::<_, String>(bytes)
+                        }).await.map_err(|_| "Thumbnail request timed out".to_string())??;
+                        if bytes.is_empty() {
+                            return Ok(String::new());
+                        }
+                        // Only complete previews enter the cache.
+                        let _ = tokio::fs::write(cache_dir.join(format!("{}jpg", cache_prefix)), &bytes).await;
+                        return Ok(format!("data:image/jpeg;base64,{}", general_purpose::STANDARD.encode(&bytes)));
                     }
                 },
                 _ => return Ok("".to_string()),
@@ -275,7 +370,7 @@ pub async fn cmd_get_thumbnail(
 
             if is_image {
                 // Get photo thumbnail (smallest size for speed)
-                let save_path = cache_dir.join(format!("{}.{}", message_id, ext));
+                let save_path = cache_dir.join(format!("{}{}", cache_prefix, ext));
                 let save_path_str = save_path.to_string_lossy().to_string();
 
                 // Download the thumbnail/photo
